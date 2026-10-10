@@ -1,0 +1,131 @@
+name: iOS package for local signing
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/ios-resign-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-resign-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Record build environment
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            sw_vers
+          } | tee out/build-environment.txt
+
+      - name: Run upstream shared-logic checks
+        run: |
+          set -euo pipefail
+          swiftc -o "$RUNNER_TEMP/jevcheck" tools/PromptCheck/main.swift Shared/*.swift
+          "$RUNNER_TEMP/jevcheck" | tee out/shared-checks.txt
+
+      - name: Build device app and keyboard without developer credentials
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project JevJarvis.xcodeproj \
+            -scheme JevJarvis \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/jev-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build 2>&1 | tee out/xcodebuild.log
+
+      - name: Preserve extension entitlements and package IPA
+        run: |
+          set -euo pipefail
+          export JEV_APP="$RUNNER_TEMP/jev-build/Build/Products/Release-iphoneos/JevJarvis.app"
+          export JEV_EXTENSION="$JEV_APP/PlugIns/JevKeyboard.appex"
+          test -d "$JEV_EXTENSION"
+          python3 - <<'PY'
+          import os, pathlib, plistlib
+          app = pathlib.Path(os.environ["JEV_APP"])
+          ext = pathlib.Path(os.environ["JEV_EXTENSION"])
+          for bundle, expected in [(app, "com.jevchat.jarvis"), (ext, "com.jevchat.jarvis.keyboard")]:
+              with (bundle / "Info.plist").open("rb") as f:
+                  info = plistlib.load(f)
+              assert info["CFBundleIdentifier"] == expected, info["CFBundleIdentifier"]
+              assert info["CFBundleSupportedPlatforms"] == ["iPhoneOS"]
+              assert (bundle / info["CFBundleExecutable"]).is_file()
+          for p in ["App/JevJarvis.entitlements", "Keyboard/JevKeyboard.entitlements"]:
+              with open(p, "rb") as f:
+                  entitlements = plistlib.load(f)
+              assert entitlements["com.apple.security.application-groups"] == ["group.com.jevchat.jarvis"]
+          print("Device app, embedded keyboard and source App Group entitlements verified.")
+          PY
+          # Ad-hoc signatures carry entitlements for the local re-signing tool.
+          # They are NOT Apple developer signatures and do NOT permit installation.
+          codesign --force --sign - --entitlements Keyboard/JevKeyboard.entitlements "$JEV_EXTENSION"
+          codesign --force --sign - --entitlements App/JevJarvis.entitlements "$JEV_APP"
+          codesign --verify --strict "$JEV_EXTENSION"
+          codesign --verify --strict "$JEV_APP"
+          codesign -d --entitlements :- "$JEV_APP" > out/app-entitlements.plist
+          codesign -d --entitlements :- "$JEV_EXTENSION" > out/keyboard-entitlements.plist
+          lipo -archs "$JEV_APP/JevJarvis" | tee out/app-architectures.txt
+          lipo -archs "$JEV_EXTENSION/JevKeyboard" | tee out/keyboard-architectures.txt
+          mkdir -p "$RUNNER_TEMP/jev-package/Payload"
+          ditto "$JEV_APP" "$RUNNER_TEMP/jev-package/Payload/JevJarvis.app"
+          (
+            cd "$RUNNER_TEMP/jev-package"
+            /usr/bin/zip -q -r "$GITHUB_WORKSPACE/out/JevJarvis-resign-required.ipa" Payload
+          )
+          unzip -tq out/JevJarvis-resign-required.ipa
+          cp LICENSE NOTICE out/
+          cat > out/INSTALL-NOTES.txt <<'NOTES'
+          This IPA requires local signing before installation.
+          It is an upstream Jev iOS build, not a finished custom chat assistant.
+          No Apple developer certificate, Apple account or model API key was used.
+          Preserve the JevKeyboard extension when re-signing.
+          The host app and keyboard must share the same valid App Group.
+          App Group compatibility after Windows re-signing is NOT yet verified.
+          iPhone 17 / iOS 26.0 / WeChat behavior is NOT yet verified on a real device.
+          Enter model credentials only in the installed app, not in GitHub.
+          Passing build checks does not establish successful installation.
+          NOTES
+          (
+            cd out
+            shasum -a 256 JevJarvis-resign-required.ipa > SHA256SUMS.txt
+          )
+          {
+            echo '### Device build packaged for local re-signing'
+            echo 'Download the jev-ios-resign-required artifact below.'
+            echo 'Real-device installation, App Group sharing and WeChat use remain unverified.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload package and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jev-ios-resign-required
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
